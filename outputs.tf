@@ -93,7 +93,7 @@ output "postgres_server_port" {
 }
 
 output "nat_ip" {
-  value = module.vpc.nat_public_ips[0]
+  value =  var.vpc_id == null ? module.vpc.nat_public_ips[0] : null
 }
 
 output "prefix" {

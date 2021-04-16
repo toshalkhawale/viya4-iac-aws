@@ -3,39 +3,6 @@
 # Terraform Registry : https://registry.terraform.io/namespaces/terraform-aws-modules
 # GitHub Repository  : https://github.com/terraform-aws-modules
 #
-terraform {
-  required_version = ">= 0.13.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "3.27.0"
-    }
-    random = {
-      source = "hashicorp/random"
-      version = "3.0.1"
-    }  
-    local = {
-      source = "hashicorp/local"
-      version = "2.0.0"
-    }
-    null = {
-      source = "hashicorp/null"
-      version = "3.0.0"
-    }
-    template = {
-      source = "hashicorp/template"
-      version = "2.2.0"
-    }
-    external = {
-      source = "hashicorp/external"
-      version = "2.0.0"
-    }
-    kubernetes = {
-      source = "hashicorp/kubernetes"
-      version = "2.0.2"
-    }
-  }
-}
 
 provider "aws" {
   region                  = var.location
@@ -66,12 +33,22 @@ locals {
   cluster_endpoint_public_access_cidrs = length(local.cluster_endpoint_cidrs) == 0 ? [] : local.cluster_endpoint_cidrs
   postgres_public_access_cidrs         = var.postgres_public_access_cidrs == null ? local.default_public_access_cidrs : var.postgres_public_access_cidrs
 
-  jump_vm_subnet                       = var.create_jump_public_ip ? module.vpc.public_subnets[0] : module.vpc.private_subnets[0]
-  nfs_vm_subnet                        = var.create_nfs_public_ip ? module.vpc.public_subnets[0] : module.vpc.private_subnets[0]
+  vpc_private_subnets                  = length(var.subnet_ids) == 0 ? module.vpc.private_subnets : var.subnet_ids["private"]
+
+  db_subnet_public                     = length(var.subnet_ids) == 0 ? module.vpc.public_subnets : var.subnet_ids["public"]
+  db_subnet_private                    = length(var.subnet_ids) == 0 ? module.vpc.database_subnets : var.subnet_ids["private"]
+
+  jump_vm_subnet_public                = length(var.subnet_ids) == 0 ? module.vpc.public_subnets[0] : var.subnet_ids["public"][0]
+  jump_vm_subnet_private               = length(var.subnet_ids) == 0 ? module.vpc.private_subnets[0] : var.subnet_ids["private"][0]
+
+  nfs_vm_subnet_public                 = length(var.subnet_ids) == 0 ? module.vpc.public_subnets[0] : var.subnet_ids["public"][0]
+  nfs_vm_subnet_private                = length(var.subnet_ids) == 0 ? module.vpc.public_subnets[0] : var.subnet_ids["private"][0]
 
   kubeconfig_filename = "${var.prefix}-eks-kubeconfig.conf"
   kubeconfig_path     = var.iac_tooling == "docker" ? "/workspace/${local.kubeconfig_filename}" : local.kubeconfig_filename
   kubeconfig_ca_cert  = data.aws_eks_cluster.cluster.certificate_authority.0.data
+
+  subnets = length(var.subnet_ids) == 0 ? var.subnets : {}
 }
 
 data "external" "git_hash" {
@@ -113,14 +90,16 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "2.70.0"
 
+  create_vpc = var.vpc_id == null ? true : false
+
   name = "${var.prefix}-vpc"
   cidr = var.vpc_cidr
   # NOTE - Only have a list of 2 AZs. Then only look for these subnets in the EFS mount below.
   # azs                  = slice( data.aws_availability_zones.available.names, 0,1 )
   azs                  = data.aws_availability_zones.available.names
-  private_subnets      = var.private_subnets
-  public_subnets       = var.public_subnets
-  database_subnets     = var.database_subnets
+  private_subnets      = length(var.subnet_ids) == 0 ? local.subnets.private : []
+  public_subnets       = length(var.subnet_ids) == 0 ? local.subnets.public : []
+  database_subnets     = length(var.subnet_ids) == 0 ? local.subnets.db : []
   enable_nat_gateway   = true
   single_nat_gateway   = true
   enable_dns_hostnames = true
@@ -133,24 +112,26 @@ module "vpc" {
 
 # Associate private subnets with the private routing table.
 resource "aws_route_table_association" "private" {
-  count = length(module.vpc.private_subnets)
+  count = length(var.subnet_ids) == 0 ? length(local.subnets.private) : 0 
 
-  subnet_id      = module.vpc.private_subnets[count.index]
-  route_table_id = module.vpc.private_route_table_ids[0]
+  subnet_id      = length(var.subnet_ids) == 0 ? local.subnets.private[count.index] : module.vpc.private_subnets[count.index]
+  ## TODO: handle BYO network - lookup route_table_id from subnet_id?
+  route_table_id = length(var.subnet_ids) == 0 ? local.subnets.private[count.index] : module.vpc.private_route_table_ids[0]
 }
 
 # Associate public subnets with the public routing table.
 resource "aws_route_table_association" "public" {
-  count = length(module.vpc.public_subnets)
+  count = length(var.subnet_ids) == 0 ? length(local.subnets.private) : 0 
 
-  subnet_id      = module.vpc.public_subnets[count.index]
-  route_table_id = module.vpc.public_route_table_ids[0]
+  subnet_id      = length(var.subnet_ids) == 0 ? local.subnets.private[count.index] : module.vpc.public_subnets[count.index]
+  ## TODO: handle BYO network - lookup route_table_id from subnet_id?
+  route_table_id = length(var.subnet_ids) == 0 ? local.subnets.private[count.index] : module.vpc.public_route_table_ids[0]
 }
 
 # Security Groups - https://www.terraform.io/docs/providers/aws/r/security_group.html
 resource "aws_security_group" "sg" {
   name   = "${var.prefix}-sg"
-  vpc_id = module.vpc.vpc_id
+  vpc_id = var.vpc_id == null ? module.vpc.vpc_id : var.vpc_id
 
   egress {
     description = "Allow all outbound traffic."
@@ -174,9 +155,9 @@ resource "aws_efs_file_system" "efs-fs" {
 # EFS Mount Target - https://www.terraform.io/docs/providers/aws/r/efs_mount_target.html
 resource "aws_efs_mount_target" "efs-mt" {
   # NOTE - Testing. use num_azs = 2
-  count           = var.storage_type == "ha" ? length(module.vpc.private_subnets) : 0
+  count           = var.storage_type == "ha" ? length(local.vpc_private_subnets) : 0
   file_system_id  = aws_efs_file_system.efs-fs.0.id
-  subnet_id       = element(module.vpc.private_subnets, count.index)
+  subnet_id       = element(local.vpc_private_subnets, count.index)
   security_groups = [aws_security_group.sg.id]
 }
 
@@ -209,7 +190,7 @@ module "jump" {
   source             = "./modules/aws_vm"
   name               = "${var.prefix}-jump"
   tags               = var.tags
-  subnet_id          = local.jump_vm_subnet
+  subnet_id          = var.create_jump_public_ip ? local.jump_vm_subnet_public : local.jump_vm_subnet_private
   security_group_ids = [aws_security_group.sg.id]
   create_public_ip   = var.create_jump_public_ip
 
@@ -256,7 +237,7 @@ data "template_file" "nfs-cloudconfig" {
 
   vars = {
     vm_admin        = var.nfs_vm_admin
-    base_cidr_block = var.vpc_cidr
+    base_cidr_block = var.vpc_cidr  ## TODO: handle BYO network
   }
 
 }
@@ -279,7 +260,7 @@ module "nfs" {
   source             = "./modules/aws_vm"
   name               = "${var.prefix}-nfs-server"
   tags               = var.tags
-  subnet_id          = local.nfs_vm_subnet
+  subnet_id          = var.create_jump_public_ip ? local.nfs_vm_subnet_public : local.nfs_vm_subnet_private
   security_group_ids = [aws_security_group.sg.id]
   create_public_ip   = var.create_nfs_public_ip
 
@@ -384,12 +365,12 @@ module "eks" {
   cluster_name                          = local.cluster_name
   cluster_version                       = var.kubernetes_version
   cluster_endpoint_private_access       = true
-  cluster_endpoint_private_access_cidrs = [var.vpc_cidr]
+  cluster_endpoint_private_access_cidrs = [var.vpc_cidr]  ## TODO: handle BYO network
   cluster_endpoint_public_access        = true
   cluster_endpoint_public_access_cidrs  = local.cluster_endpoint_public_access_cidrs
   write_kubeconfig                      = false
-  subnets                               = concat([module.vpc.private_subnets.0, module.vpc.private_subnets.1])
-  vpc_id                                = module.vpc.vpc_id
+  subnets                               = length(var.subnet_ids) == 0 ? concat([module.vpc.private_subnets.0, module.vpc.private_subnets.1]) : var.subnet_ids["private"]
+  vpc_id                                = var.vpc_id == null ? module.vpc.vpc_id : var.vpc_id
   tags                                  = var.tags
 
   workers_group_defaults = {
@@ -454,7 +435,7 @@ module "db" {
 
   # DB subnet group - use public subnet if public access is requested
   publicly_accessible = length(local.postgres_public_access_cidrs) > 0 ? true : false
-  subnet_ids          = length(local.postgres_public_access_cidrs) > 0 ? module.vpc.public_subnets : module.vpc.database_subnets
+  subnet_ids          = length(local.postgres_public_access_cidrs) > 0 ? local.db_subnet_public : local.db_subnet_private
 
   # DB parameter group
   family = "postgres${var.postgres_server_version}"
